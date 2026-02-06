@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+env/
+.venv/
+venv/
+
+# Streamlit
+.streamlit/
+
+# Chroma / vector DB
+chroma_db/
+
+# ML caches
+.cache/
+*.pt
+*.bin
+
+# OS
+.DS_Store

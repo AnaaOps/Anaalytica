@@ -1,0 +1,19 @@
+streamlit==1.28.0
+python-dotenv==1.0.0
+PyPDF2==3.0.1
+
+# LangChain (modern split packages)
+langchain==0.1.16
+langchain-community==0.0.38
+langchain-text-splitters==0.0.1
+langchain-groq==0.1.1
+
+# Vector DB
+chromadb==0.4.22
+
+# Embeddings
+sentence-transformers==2.2.2
+transformers==4.36.2
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.1.2+cpu
