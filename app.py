@@ -3,11 +3,27 @@ import tempfile
 import streamlit as st
 from dotenv import load_dotenv
 import numpy as np
-load_dotenv()
 
+# OCR imports
+import pytesseract
+from pdf2image import convert_from_path
+
+from langchain.schema import Document
 from langchain_community.vectorstores import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
+
+load_dotenv()
+
+# -----------------------------
+# OCR helper
+# -----------------------------
+def ocr_pdf(pdf_path: str) -> str:
+    images = convert_from_path(pdf_path)
+    text = ""
+    for img in images:
+        text += pytesseract.image_to_string(img) + "\n"
+    return text.strip()
 
 # -----------------------------
 # Streamlit config
@@ -25,27 +41,25 @@ st.caption("Turn documents into intelligence.")
 # API keys check
 # -----------------------------
 if not os.getenv("GROQ_API_KEY"):
-    st.error("❌ GROQ_API_KEY missing (required for ChatGroq)")
+    st.error("❌ GROQ_API_KEY missing (required)")
     st.stop()
 
 if not os.getenv("OPENAI_API_KEY"):
-    st.warning("OPENAI_API_KEY not set — the app will use local embeddings instead of OpenAI.")
+    st.warning("⚠️ OPENAI_API_KEY not set — local embeddings will be used")
 
 # -----------------------------
-# Sidebar settings
+# Sidebar
 # -----------------------------
 with st.sidebar:
     st.header("⚙ Settings")
     chunk_size = st.slider("Chunk size", 400, 1500, 800, 100)
     chunk_overlap = st.slider("Chunk overlap", 0, 300, 100, 10)
-    
+
     if st.button("🧹 Clear Vector Database"):
         import shutil
         if os.path.exists("chroma_db"):
             shutil.rmtree("chroma_db")
-            st.success("Cleared ChromaDB database")
-        else:
-            st.info("No ChromaDB database found")
+            st.success("Vector DB cleared")
 
 # -----------------------------
 # Upload PDFs
@@ -57,22 +71,41 @@ uploaded_files = st.file_uploader(
 )
 
 # -----------------------------
-# Process PDFs
+# Process PDFs (TEXT + SCANNED)
 # -----------------------------
 if st.button("🚀 Process PDFs") and uploaded_files:
-    # Clear previous ChromaDB to prevent dimension mismatches
     import shutil
+
     if os.path.exists("chroma_db"):
         shutil.rmtree("chroma_db")
-    
+
     docs = []
 
-    with st.spinner("Reading PDFs..."):
+    with st.spinner("📄 Reading PDFs..."):
         for pdf in uploaded_files:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp.write(pdf.read())
-                loader = PyPDFLoader(tmp.name)
-                docs.extend(loader.load())
+
+            loader = PyPDFLoader(tmp.name)
+            loaded_docs = loader.load()
+
+            # 🔍 Detect scanned PDF
+            if not loaded_docs or all(len(d.page_content.strip()) == 0 for d in loaded_docs):
+                st.warning(f"🖼️ Scanned PDF detected: {pdf.name} — running OCR")
+                ocr_text = ocr_pdf(tmp.name)
+
+                if ocr_text.strip():
+                    loaded_docs = [
+                        Document(
+                            page_content=ocr_text,
+                            metadata={"source": pdf.name}
+                        )
+                    ]
+                else:
+                    st.error(f"❌ OCR failed for {pdf.name}")
+                    continue
+
+            docs.extend(loaded_docs)
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
@@ -80,47 +113,59 @@ if st.button("🚀 Process PDFs") and uploaded_files:
     )
     chunks = splitter.split_documents(docs)
 
-    # Try OpenAI embeddings first
+    # -----------------------------
+    # Embeddings (OpenAI → HF → TF-IDF)
+    # -----------------------------
     try:
         from langchain_openai import OpenAIEmbeddings
+
         embeddings = OpenAIEmbeddings(
             model="text-embedding-3-small",
             openai_api_key=os.getenv("OPENAI_API_KEY")
         )
-        
-        vectorstore = Chroma.from_documents(chunks, embeddings, persist_directory="chroma_db")
+
+        vectorstore = Chroma.from_documents(
+            chunks,
+            embeddings,
+            persist_directory="chroma_db"
+        )
+
         st.session_state.vectorstore = vectorstore
         st.success(f"✅ Processed {len(chunks)} chunks (OpenAI embeddings)")
 
     except Exception as e:
-        st.warning(f"OpenAI embeddings failed: {e}. Falling back to local embeddings.")
-        
+        st.warning(f"OpenAI embeddings failed → {e}")
+
         try:
             from langchain_community.embeddings import HuggingFaceEmbeddings
+
             embeddings = HuggingFaceEmbeddings(
                 model_name="sentence-transformers/all-MiniLM-L6-v2"
             )
-            
-            vectorstore = Chroma.from_documents(chunks, embeddings, persist_directory="chroma_db")
+
+            vectorstore = Chroma.from_documents(
+                chunks,
+                embeddings,
+                persist_directory="chroma_db"
+            )
+
             st.session_state.vectorstore = vectorstore
             st.success(f"✅ Processed {len(chunks)} chunks (local embeddings)")
-            
+
         except Exception as e2:
-            st.warning(f"Local embeddings failed: {e2}. Using simple fallback...")
-            
-            # Simple TF-IDF fallback
+            st.warning("Using TF-IDF fallback")
+
             from sklearn.feature_extraction.text import TfidfVectorizer
-            import numpy as np
-            
-            texts = [chunk.page_content for chunk in chunks]
-            metadatas = [chunk.metadata for chunk in chunks]
-            
+
+            texts = [c.page_content for c in chunks]
+            metadatas = [c.metadata for c in chunks]
+
             st.session_state.tfidf_texts = texts
             st.session_state.tfidf_metadatas = metadatas
-            st.session_state.tfidf_vectorizer = TfidfVectorizer(max_features=384)
+            st.session_state.tfidf_vectorizer = TfidfVectorizer(max_features=512)
             st.session_state.tfidf_matrix = st.session_state.tfidf_vectorizer.fit_transform(texts)
-            
-            st.success(f"✅ Processed {len(chunks)} chunks (TF-IDF embeddings)")
+
+            st.success(f"✅ Processed {len(chunks)} chunks (TF-IDF)")
 
 # -----------------------------
 # Question Answering
@@ -130,57 +175,53 @@ if "vectorstore" in st.session_state or "tfidf_texts" in st.session_state:
     question = st.text_input("💬 Ask a question about the PDFs")
 
     if question:
-        # Use ChatGroq with CORRECT MODEL NAME
         try:
             from langchain_groq import ChatGroq
-            # FIXED: Using current working model
+
             llm = ChatGroq(
-                model="llama-3.3-70b-versatile",  # ← CORRECT MODEL
+                model="llama-3.3-70b-versatile",
                 temperature=0,
                 api_key=os.getenv("GROQ_API_KEY")
             )
+
             use_mock = False
         except Exception as e:
-            st.error(f"ChatGroq failed: {e}")
+            st.error(f"LLM failed: {e}")
             use_mock = True
-        
+
         if use_mock:
             class MockLLM:
                 def invoke(self, prompt):
-                    class Response:
-                        content = "Mock response - ChatGroq not available"
-                    return Response()
+                    class R:
+                        content = "LLM unavailable"
+                    return R()
             llm = MockLLM()
 
-        # Retrieve relevant documents
+        # Retrieve docs
         relevant_docs = []
-        
-        if "vectorstore" in st.session_state:
-            # Use Chroma vector store
-            docs = st.session_state.vectorstore.similarity_search(question, k=4)
-            relevant_docs = docs
-        else:
-            # Use TF-IDF
-            from sklearn.metrics.pairwise import cosine_similarity
-            q_vec = st.session_state.tfidf_vectorizer.transform([question])
-            similarities = cosine_similarity(q_vec, st.session_state.tfidf_matrix).flatten()
-            top_indices = np.argsort(similarities)[-4:][::-1]
-            
-            for idx in top_indices:
-                relevant_docs.append({
-                    "page_content": st.session_state.tfidf_texts[idx],
-                    "metadata": st.session_state.tfidf_metadatas[idx]
-                })
 
-        # Build context
-        context = "\n\n".join([
-            getattr(doc, 'page_content', doc.get('page_content', str(doc))) 
-            for doc in relevant_docs
-        ])
+        if "vectorstore" in st.session_state:
+            relevant_docs = st.session_state.vectorstore.similarity_search(question, k=4)
+        else:
+            from sklearn.metrics.pairwise import cosine_similarity
+
+            q_vec = st.session_state.tfidf_vectorizer.transform([question])
+            sims = cosine_similarity(q_vec, st.session_state.tfidf_matrix).flatten()
+            top = np.argsort(sims)[-4:][::-1]
+
+            for i in top:
+                relevant_docs.append(
+                    Document(
+                        page_content=st.session_state.tfidf_texts[i],
+                        metadata=st.session_state.tfidf_metadatas[i]
+                    )
+                )
+
+        context = "\n\n".join(d.page_content for d in relevant_docs)
 
         prompt = f"""
-Answer the question using ONLY the context below.
-If the answer is not in the context, say "I don't know".
+Answer using ONLY the context below.
+If not present, say "I don't know".
 
 Context:
 {context}
@@ -189,18 +230,17 @@ Question:
 {question}
 """
 
-        with st.spinner("Thinking..."):
+        with st.spinner("🧠 Thinking..."):
             response = llm.invoke(prompt)
 
         st.subheader("🧠 Answer")
-        answer_text = getattr(response, 'content', response)
-        st.write(answer_text)
+        st.write(getattr(response, "content", response))
 
         st.subheader("📚 Sources")
-        for doc in relevant_docs:
-            metadata = getattr(doc, 'metadata', doc.get('metadata', {}))
-            source = metadata.get('source', 'PDF')
-            page = metadata.get('page', 'N/A')
-            st.write(f"- {source} (page {page})")
+        for d in relevant_docs:
+            src = d.metadata.get("source", "PDF")
+            page = d.metadata.get("page", "N/A")
+            st.write(f"- {src} (page {page})")
+
 else:
-    st.info("Upload PDFs and click **Process PDFs** to begin.")
+    st.info("📤 Upload PDFs and click **Process PDFs**")
